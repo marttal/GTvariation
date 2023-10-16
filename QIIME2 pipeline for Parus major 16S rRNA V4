@@ -1,0 +1,272 @@
+# QIIME2 pipeline for the 16S rRNA gene V4 region
+# M Liukkonen 2023
+
+#Can easily extract file names by using ls and copying into excel - then just need to add the rest of the path - see example
+
+###### uploading data from demultiplexed and trimmed files
+# first check format of metadata and manifest files in https://keemei.qiime2.org then convert to a txt file
+
+qiime tools import --type 'SampleData[PairedEndSequencesWithQuality]' --input-path manifest_novaseq.csv --output-path sequences_novaseq.qza --input-format PairedEndFastqManifestPhred33
+
+###### check quality of sequences and look at using qiime view on chrome/firefox |
+
+qiime demux summarize \
+--i-data sequences_novaseq.qza \
+--o-visualization qualitysummary_novaseq.qzv \
+--verbose
+
+# remove 16s primers (both sets) and any bases (e.g., adapters and linkers following), reads with no forward primer and reads shorter than 100bp - it will look file three times to check for primer removal
+
+qiime cutadapt trim-paired \
+--i-demultiplexed-sequences sequences_novaseq.qza \
+--p-adapter-f CGTGYCAGCMGCCGCGGTAA...ATTAGAWACCCBNGTAGTCCG \
+--p-adapter-r CGGACTACNVGGGTWTCTAAT...TTACCGCGGCKGCTGRCACG \
+--p-discard-untrimmed \
+--p-error-rate 0.1 \
+--p-minimum-length 100 \
+--p-overlap 5 \
+--p-times 3 \
+--o-trimmed-sequences sequences_trimmed_novaseq.qza \
+--verbose
+
+echo "trimmaus toimii"
+
+qiime demux summarize \
+--i-data sequences_trimmed_novaseq.qza \
+--o-visualization qualitysummary_trimmed_novaseq.qzv \
+--verbose
+
+##########################################
+
+##DADA2 - trim first 5 bases and trunacate to 220 bases - based on above quality summary - used shorter trim than normal as primers already removed in cutadapt
+#Note novaseq bins quality scores into 4 (rather than keeping as continuos), this is a problem for dada2 - the outputs seemed reliable on my data - but this is a possible work around if you think the outputs are not reliable or you are loosing more reads than expected at any given stage - https://github.com/ErnakovichLab/dada2_ernakovichlab#learn-the-error-rates
+# create a batch file
+# named dada2_run1.sh
+
+######################################################
+
+#!/bin/bash
+#SBATCH --job-name=qiime_novaseq_denoise
+#SBATCH --account=project_ ### your project number etc.
+#SBATCH --time=60:00:00
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --output==qiime_out_8
+#SBATCH --error=qiime_err_8
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=50G
+#SBATCH --partition=small
+#SBATCH --gres=nvme:100
+#SBATCH --mail-type=BEGIN,END,FAIL
+
+#set up qiime
+export PROJAPPL=/projappl/project_ ### your project number etc.
+module load qiime2
+export TMPDIR="$LOCAL_SCRATCH"
+
+echo "qiime2 moduuli on ladattu"
+
+qiime dada2 denoise-paired \
+--i-demultiplexed-seqs sequences_trimmed_novaseq.qza \
+--o-table table_25_210_novaseq.qza \
+--o-representative-sequences rep-seqs-25_210_novaseq.qza \
+--p-trunc-len-f 220 \
+--p-trunc-len-r 220 \
+--p-trim-left-f 5 \
+--p-trim-left-r 5 \
+--p-chimera-method consensus \
+--o-denoising-stats stats-dada_25_210_novaseq.qza \ 
+--p-n-threads 1 \
+
+echo "dada2 complete"
+
+###########################################
+
+#opens file
+nano dada2_novaseq.sh
+
+# checks file for errors
+dos2unix dada2_novaseq.sh 
+
+# then run the bash script
+sbatch dada2_novaseq.sh
+
+# lets you see how job is going
+squeue -u daviecsx
+
+## once done create table and rep-seqs for visualization
+
+qiime feature-table summarize \
+  --verbose \
+  --i-table table_25_210_novaseq.qza \
+  --o-visualization table_25_210_novaseq.qzv \
+  --m-sample-metadata-file Metadata_novaseq.tsv
+
+qiime feature-table tabulate-seqs \
+  --verbose \
+  --i-data rep-seqs-25_210_novaseq.qza \
+  --o-visualization rep-seqs-25_210_novaseq.qzv
+
+qiime metadata tabulate \
+  --m-input-file stats-dada_25_210_novaseq.qza \
+  --o-visualization stats-dada_25_210_novaseq.qzv
+
+# have a look at the outputs etc.....
+
+######### Generate a tree for phylogenetic diversity analyses
+
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences rep-seqs-25_210_novaseq.qza \
+  --o-alignment aligned-rep-seqs-25_210_novaseq.qza \
+  --o-masked-alignment masked-aligned-rep-seqs-25_210_novaseq.qza \
+  --o-tree unrooted-tree-25_210_novaseq.qza \
+  --o-rooted-tree rooted-tree-25_210_novaseq.qza \
+  --verbose
+
+
+#########TAXONOMIC ANALYSIS - using q2-feature-classifier + using silva 
+
+#first make new directory and load data
+
+mkdir training-feature-classifiers-silva
+
+cd training-feature-classifiers-silva
+
+# import the two files into qiime2 compatible files - get data from silva website
+
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path silva_132_99_16S.fna \
+  --output-path silva_132_99_16S.qza
+
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-format HeaderlessTSVTaxonomyFormat \
+  --input-path majority_taxonomy_7_levels.txt \
+  --output-path silva_ref-taxonomy.qza
+
+# train classifiers - trained using shorter primer sequence only - run fit-classifier as a batch script (batch job scripts at the end for this)
+
+ qiime feature-classifier extract-reads \
+  --i-sequences silva_132_99_16S.qza \
+  --p-f-primer GTGYCAGCMGCCGCGGTAA \
+  --p-r-primer GGACTACNVGGGTWTCTAAT \
+  --o-reads silva_132_99_16S_ref-seqs.qza
+
+qiime feature-classifier fit-classifier-naive-bayes \
+  --i-reference-reads silva_132_99_16S_ref-seqs.qza \
+  --i-reference-taxonomy silva_ref-taxonomy.qza \
+  --o-classifier classifier_silva.qza
+
+########### classify my reads - recommend to submit as a batch job - takes too long otherwise (batch job scripts at the end for this)
+
+  qiime feature-classifier classify-sklearn \
+  --i-classifier classifier_silva.qza \
+  --i-reads rep-seqs-25_210_novaseq.qza \
+  --o-classification taxonomy-25_210_novaseq.qza
+
+###### and get barplots and visually check data 
+
+qiime metadata tabulate \
+  --m-input-file taxonomy-25_210_novaseq.qza \
+  --o-visualization taxonomy-25_210_novaseq.qzv
+
+  qiime taxa barplot \
+  --i-table table_25_210_novaseq.qza \
+  --i-taxonomy taxonomy-25_210_novaseq.qza \
+  --m-metadata-file Metadata_novaseq.tsv \
+  --o-visualization taxa-bar-plots-25_210_novaseq.qzv
+
+
+## FILTER DATA:  to remove mitochondria, chloroplast, archaeae and unnasigned taxon 
+
+  qiime taxa filter-table \
+  --i-table table_25_210_novaseq.qza \
+  --i-taxonomy taxonomy-25_210_novaseq.qza \
+  --p-exclude mitochondria,chloroplast,Archaea,Unassigned \
+  --o-filtered-table table-nomcau-25_210_novaseq.qza
+
+ # remove singletons
+
+  qiime feature-table filter-samples \
+  --i-table table-nomcau-25_210_novaseq.qza \
+  --p-min-features 2 \
+  --o-filtered-table table-nomcaus25_210_novaseq.qza
+
+# remove taxa not assigned to at least a phylum
+
+qiime taxa filter-table \
+  --i-table table-nomcaus25_210_novaseq.qza \
+  --i-taxonomy taxonomy-25_210_novaseq.qza \
+  --p-include D_1__ \
+  --o-filtered-table table-final-clean_25_210_novaseq.qza
+
+qiime feature-table summarize \
+  --verbose \
+  --i-table table-final-clean_25_210_novaseq.qza \
+  --o-visualization table-clean-25_210_novaseq.qzv \
+  --m-sample-metadata-file Metadata_novaseq.tsv
+
+qiime taxa barplot \
+  --i-table table-final-clean_25_210_novaseq.qza \
+  --i-taxonomy taxonomy-25_210_novaseq.qza \
+  --m-metadata-file Metadata_novaseq.tsv \
+  --o-visualization taxa-bar-plots-25_210-clean_novaseq.qzv
+
+#################################
+
+######################################################
+
+#!/bin/bash
+#SBATCH --job-name=silva_class
+#SBATCH --account=project_ ### your project number etc.
+#SBATCH --time=50:00:00
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --output==qiime_out_8
+#SBATCH --error=qiime_err_8
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=50G
+#SBATCH --partition=small
+#SBATCH --gres=nvme:100
+#SBATCH --mail-type=BEGIN,END,FAIL
+
+#set up qiime
+export PROJAPPL=/projappl/project_ ### your project number etc.
+module load qiime2
+export TMPDIR="$LOCAL_SCRATCH"
+
+qiime feature-classifier fit-classifier-naive-bayes \
+--i-reference-reads silva_132_99_16S_ref-seqs.qza \
+--i-reference-taxonomy silva_ref-taxonomy.qza \
+--o-classifier classifier_silva.qza
+
+#########################################################
+
+#!/bin/bash
+#SBATCH --job-name=silva_learn
+#SBATCH --account=project_ ### your project number etc.
+#SBATCH --time=50:00:00
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --output==qiime_out_8
+#SBATCH --error=qiime_err_8
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=50G
+#SBATCH --partition=small
+#SBATCH --gres=nvme:100
+#SBATCH --mail-type=BEGIN,END,FAIL
+
+#set up qiime
+export PROJAPPL=/projappl/project_ #### your project number etc
+module load qiime2
+export TMPDIR="$LOCAL_SCRATCH"
+
+echo “$TMPDIR”
+
+qiime feature-classifier classify-sklearn \
+--i-classifier classifier_silva.qza \
+--i-reads rep-seqs-25_210_novaseq.qza \
+--o-classification taxonomy-25_210_novaseq.qza \
+
+#######################################################
